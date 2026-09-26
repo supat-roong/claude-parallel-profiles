@@ -349,8 +349,11 @@ function main() {
   // On unsupported platforms the extension activates into an inert mode and never
   // created anything, so there is nothing to revert — and guessing at other OSes'
   // file layouts on uninstall is exactly the manipulation that mode promises not
-  // to do.
-  if (os.platform() !== 'linux') return;
+  // to do. On a Keychain-backed Mac there are no token files, so the token steps
+  // below find nothing; the Keychain entries of `~/.claude-slot-*` stores are
+  // Claude Code's, and removing them needs `claude auth logout` — far too slow
+  // for this hook's deadline. Forget an account first to clear its entry.
+  if (os.platform() !== 'linux' && os.platform() !== 'darwin') return;
 
   // A newer copy is live and this data is now ITS data. Touch nothing.
   if (anotherCopyInstalled()) return;

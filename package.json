@@ -66,6 +66,11 @@
         "category": "Claude Accounts"
       },
       {
+        "command": "claudeProfiles.addAccount",
+        "title": "Add Account",
+        "category": "Claude Accounts"
+      },
+      {
         "command": "claudeProfiles.removeProfile",
         "title": "Forget a Saved Account",
         "category": "Claude Accounts"

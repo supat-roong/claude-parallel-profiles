@@ -2,14 +2,16 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as crypto from 'crypto';
 import { Account, AccountRegistry, readIdentity, hasCredentials } from './accounts';
 import { WindowBinding } from './binding';
-import { getAuthStatus, AuthStatus } from './cli';
+import { getAuthStatus, AuthStatus, logoutSlot } from './cli';
 import { snapshotAccount, defaultSourceDir, mirrorToDefault } from './capture';
 import { ensureSharedHistory } from './sharedHistory';
 import { signOut, interruptSessions, dirsHoldingToken } from './reclaim';
 import { refreshStore, allWorkingDirs, materialize } from './workdir';
 import { log } from './log';
+import { keychainMode } from './platform';
 
 /**
  * All the user-facing flows.
@@ -155,7 +157,17 @@ export class SetupWizard {
       known.email = status.email;
       await this.registry.add(known);
       refreshStore(known, sourceDir);
+      const slot = this.binding.getSecureDir();
       await this.binding.bind(known);
+      // Keychain mode: signing in as an account that is already saved put a second
+      // token for it into this window's slot. The saved one is used from now on;
+      // the duplicate would only be a credential left lying around — and once it
+      // is gone, the session still running on it needs a reload onto the saved one.
+      if (keychainMode() && slot && path.normalize(slot) !== path.normalize(known.dir)) {
+        await this.dropOrphanSlot(slot);
+        await this.requestWindowReload(`${status.email} — this window now runs its saved account.`);
+        return known;
+      }
       if (!opts.quiet) {
         vscode.window.showInformationMessage(`${status.email} — this window is bound to it.`);
       }
@@ -168,6 +180,13 @@ export class SetupWizard {
     const target: Account =
       restored ??
       (() => {
+        // Keychain mode: the token is in the slot this window signed in to, and a
+        // Keychain entry can't be moved — so that slot IS the new account's store.
+        if (keychainMode()) {
+          const name = suggestName(status.email!, (n) => !this.registry.get(n));
+          const dir = this.binding.getSecureDir() ?? defaultSourceDir();
+          return { name, dir, email: status.email };
+        }
         const name = suggestName(
           status.email!,
           (n) => !this.registry.get(n) && !fs.existsSync(path.join(os.homedir(), `.claude-${n}`))
@@ -224,6 +243,22 @@ export class SetupWizard {
     const dir = this.binding.getEnvDir() ?? defaultSourceDir();
     const onDefault = path.normalize(dir) === path.normalize(defaultSourceDir());
 
+    // Keychain mode: this window's account can vanish while its working dir still
+    // names it — a sign-in in ANOTHER window running it replaced it in their shared
+    // slot, which now holds someone else. The working dir's identity is stale;
+    // saving it would register that other account's token under this email.
+    if (keychainMode()) {
+      const active = this.binding.getActiveName();
+      if (active && !this.registry.get(active) && hasCredentials(dir)) {
+        await this.binding.release(); // release FIRST — see the forgotten branch below
+        await this.requestWindowReload(
+          `The account this window was running was replaced by a sign-in in another window, ` +
+            `so this window was signed out of it.`
+        );
+        return;
+      }
+    }
+
     if (!hasCredentials(dir)) {
       const active = this.binding.getActiveName();
 
@@ -270,7 +305,23 @@ export class SetupWizard {
 
     const active = this.binding.getActiveName();
     const bound = active ? this.registry.get(active) : undefined;
-    if (bound?.email && bound.email !== email) {
+    let replacedNotice: string | undefined;
+    // Keychain mode: a sign-in writes into this window's slot — the bound account's
+    // store, or the default `~/.claude` for a window with no account — so if a saved
+    // account owned that slot, the sign-in REPLACED it: its token is gone from this
+    // Mac. Drop the entry so the slot can be saved under the account it now holds.
+    const slot = path.normalize(this.binding.getSecureDir() ?? defaultSourceDir());
+    const occupant = keychainMode()
+      ? this.registry.list().find((a) => path.normalize(a.dir) === slot && this.registry.emailOf(a) !== email)
+      : undefined;
+    if (occupant) {
+      const was = this.registry.emailOf(occupant) ?? occupant.name;
+      log(`sign-in in this window replaced ${was} with ${email} in slot ${slot}`);
+      await this.registry.remove(occupant.name);
+      replacedNotice =
+        `Signed in as ${email}. It replaced ${was} on this Mac (they shared a Keychain slot), ` +
+        `so ${was} is signed out. To keep both, use "Add Account" before signing in.`;
+    } else if (bound?.email && bound.email !== email) {
       // The user signed in as someone else, in THIS window. There is nothing to
       // repair: the dir is this window's alone, so no other window was touched,
       // and the account that was here is safe in its own store — untouched,
@@ -281,6 +332,7 @@ export class SetupWizard {
       log(`sign-in in this window: ${bound.email} → ${email}`);
     }
 
+    const slotBefore = this.binding.getSecureDir();
     const account =
       this.registry.savedForEmail(email) ??
       (await this.captureCurrentAccount({ quiet: true, silent: true, sourceDir: dir }));
@@ -295,12 +347,23 @@ export class SetupWizard {
     mirrorToDefault(dir, readIdentity(dir));
     const changed = active !== account.name;
     if (changed) await this.binding.bind(account);
+    // Keychain mode: the window now draws on another slot than the one Claude Code
+    // read at activation (the account signed in here was already saved under its
+    // own slot). The running session keeps the old slot until a reload.
+    const slotMoved =
+      keychainMode() &&
+      path.normalize(slotBefore ?? defaultSourceDir()) !== path.normalize(account.dir);
+    if (slotMoved && slotBefore) await this.dropOrphanSlot(slotBefore);
 
     // First run only: the window was still on the shared DEFAULT dir. It is bound
     // now, but Claude Code read the default at activation and won't look again —
     // so until a reload it keeps running there, where another window's sign-in
     // could still reach it. One reload moves it onto its own dir for good.
-    if (onDefault) {
+    if (replacedNotice) {
+      await this.requestWindowReload(replacedNotice);
+    } else if (slotMoved) {
+      await this.requestWindowReload(`Signed in as ${email} — this window now runs its saved account.`);
+    } else if (onDefault) {
       await this.requestWindowReload(
         `${email} is set up. This window now runs it in a directory of its own — signing in to ` +
           `another account here will no longer disturb your other windows.`
@@ -361,6 +424,9 @@ export class SetupWizard {
     const dirs = [
       ...dirsHoldingToken(email),
       ...allWorkingDirs().filter((d) => readIdentity(d)?.email === email),
+      // Keychain mode: the /logout already deleted the slot's Keychain entry; its
+      // store still names the account until its identity is cleared too.
+      ...(keychainMode() ? [account.dir] : []),
     ];
     for (const d of dirs) signOut(d);
     vscode.window.showInformationMessage(
@@ -381,18 +447,27 @@ export class SetupWizard {
     }
 
     const activeName = this.binding.getActiveName();
-    type Item = vscode.QuickPickItem & { account: Account };
+    type Item = vscode.QuickPickItem & { account?: Account };
     const items: Item[] = accounts.map((a) => ({
       label: `${a.name === activeName ? '$(check) ' : '$(account) '}${this.registry.emailOf(a) ?? a.name}`,
       description: a.name === activeName ? 'current' : '',
       account: a,
     }));
+    // Keychain mode: signing in inside a window replaces its account, so adding
+    // one needs a fresh slot first — offer it right where accounts are picked.
+    if (keychainMode()) {
+      items.push({ label: '$(add) Add another account…', description: 'sign in without replacing one' });
+    }
 
     const picked = await vscode.window.showQuickPick(items, {
       title: 'Switch Claude account for this window (reloads the window)',
       placeHolder: 'Pick the account this window should use',
     });
     if (!picked) return;
+    if (!picked.account) {
+      await this.addAccountInteractive();
+      return;
+    }
     if (picked.account.name === activeName) {
       // Never a silent no-op: to the user a click that does nothing is a bug.
       vscode.window.showInformationMessage(
@@ -475,7 +550,18 @@ export class SetupWizard {
     // Code flushes its in-memory token back to disk, undoing the delete.
     const interrupted = interruptSessions(dirs);
     let signedOut = 0;
-    for (const dir of dirs) if (signOut(dir)) signedOut++;
+    let keychainFailed = false;
+    if (keychainMode()) {
+      // The token lives in each copy's Keychain slot. Claude Code's own logout
+      // deletes it; this extension never touches the Keychain itself.
+      for (const copy of copies) {
+        if (await logoutSlot(copy.dir, copy.dir)) signedOut++;
+        else keychainFailed = true;
+      }
+      for (const dir of [...dirs, ...copies.map((c) => c.dir)]) signOut(dir);
+    } else {
+      for (const dir of dirs) if (signOut(dir)) signedOut++;
+    }
 
     const parts = [`Forgot ${email}.`];
     parts.push(
@@ -486,6 +572,12 @@ export class SetupWizard {
     if (interrupted > 0) {
       parts.push(`Interrupted ${interrupted} active session${interrupted > 1 ? 's' : ''}.`);
     }
+    if (keychainFailed) {
+      parts.push(
+        `Could not run \`claude auth logout\`, so its Keychain entry may remain — sign out once ` +
+          `from Claude Code to remove it.`
+      );
+    }
 
     // If this window was running it, reload: Claude Code only reads its account at
     // activation, so otherwise the window sits on a dir we just emptied, with a
@@ -495,6 +587,65 @@ export class SetupWizard {
       return;
     }
     vscode.window.showInformationMessage(parts.join(' '));
+  }
+
+  // ─── Adding an account (keychain mode) ──────────────────────────────────────
+
+  /**
+   * Gives this window a fresh, empty credential slot and reloads it signed out,
+   * so the next sign-in here becomes a NEW account instead of replacing the one
+   * the window was running (in keychain mode a sign-in writes into the window's
+   * slot — see platform.keychainMode). Elsewhere every window already signs in
+   * to a dir of its own, so there is nothing to set up.
+   */
+  async addAccountInteractive(): Promise<void> {
+    if (!keychainMode()) {
+      vscode.window.showInformationMessage(
+        'Sign in with Claude Code in any window (its account menu, or /login) — the account is saved ' +
+          'automatically, without replacing your other saved accounts.'
+      );
+      return;
+    }
+    const active = this.binding.getActiveName();
+    const current = active ? this.registry.get(active) : undefined;
+    const choice = await vscode.window.showInformationMessage(
+      `Add a Claude account?\n\nThis window ${
+        current ? `stops running ${this.registry.emailOf(current) ?? current.name} and ` : ''
+      }reloads signed out. Sign in with Claude Code there (its account menu, or /login) and the ` +
+        `account is saved as a new one. Your saved accounts are not affected.`,
+      { modal: true },
+      'Add Account'
+    );
+    if (choice !== 'Add Account') return;
+
+    const slot = path.join(os.homedir(), `.claude-slot-${crypto.randomBytes(4).toString('hex')}`);
+    fs.mkdirSync(slot, { recursive: true, mode: 0o700 });
+    await this.binding.bindPendingSlot(slot);
+    // Clear the working dir's identity, or Claude Code would come up still naming
+    // the account this window just stopped running — and never offer to sign in.
+    signOut(this.binding.workingDir());
+    await this.requestWindowReload(
+      'Sign in with Claude Code (its account menu, or /login) — the account will be saved as a new one.',
+      { userInitiated: true }
+    );
+  }
+
+  /**
+   * Keychain mode: signs out and removes a credential slot that no account uses
+   * any more — an "Add Account" slot whose sign-in turned out to be an account
+   * already saved elsewhere. Only our own `.claude-slot-*` dirs, never a store a
+   * saved account still points at, and never Claude Code's default `~/.claude`.
+   */
+  private async dropOrphanSlot(slot: string): Promise<void> {
+    const norm = path.normalize(slot);
+    if (!path.basename(norm).startsWith('.claude-slot-')) return;
+    if (this.registry.list().some((a) => path.normalize(a.dir) === norm)) return;
+    await logoutSlot(norm, norm);
+    try {
+      fs.rmSync(norm, { recursive: true, force: true });
+    } catch {
+      /* best-effort: an empty folder is harmless */
+    }
   }
 }
 

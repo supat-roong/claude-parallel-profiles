@@ -5,6 +5,7 @@ import { Account } from './accounts';
 import { materialize, windowWorkingDir } from './workdir';
 import { ensureSharedHistory } from './sharedHistory';
 import { log } from './log';
+import { keychainMode, SECURE_ENV_VAR, slotEnvValue, slotDirFromEnv } from './platform';
 
 /**
  * Per-window binding of a Claude account.
@@ -30,6 +31,12 @@ const REPO_MAP_KEY = 'claudeProfiles.repoAccounts';
 /** Global: the account most recently bound anywhere — the default for a new window. */
 const LAST_KEY = 'claudeProfiles.lastAccount';
 const ENV_VAR = 'CLAUDE_CONFIG_DIR';
+/**
+ * workspaceState (keychain mode): an empty credential slot this window was given
+ * by "Add Account", waiting for a sign-in. Takes precedence over any remembered
+ * account, so the window comes up signed out and ready to sign in.
+ */
+const PENDING_SLOT_KEY = 'claudeProfiles.pendingSlot';
 
 export class WindowBinding {
   /** Fires whenever the active account for this window changes. */
@@ -87,8 +94,7 @@ export class WindowBinding {
     const wasActive = this.context.workspaceState.get<string>(ACTIVE_KEY) === account.name;
     if (wasActive) {
       await this.context.workspaceState.update(ACTIVE_KEY, undefined);
-      delete process.env[ENV_VAR];
-      this.applyTerminalEnv(undefined);
+      this.setEnv(undefined, undefined);
     }
     const map = this.getRepoMap();
     const filtered = Object.fromEntries(
@@ -125,8 +131,7 @@ export class WindowBinding {
         await this.context.globalState.update(REPO_MAP_KEY, map);
       }
     }
-    delete process.env[ENV_VAR];
-    this.applyTerminalEnv(undefined);
+    this.setEnv(undefined, undefined);
     this.onDidChange.fire();
   }
 
@@ -144,6 +149,58 @@ export class WindowBinding {
   /** The CLAUDE_CONFIG_DIR currently in this host's process env, if any. */
   getEnvDir(): string | undefined {
     return process.env[ENV_VAR];
+  }
+
+  /**
+   * Keychain mode: the credential slot this window's `claude` processes use —
+   * the bound account's store, a pending "Add Account" slot, or undefined for
+   * Claude Code's default slot (`~/.claude`).
+   */
+  getSecureDir(): string | undefined {
+    return slotDirFromEnv(process.env[SECURE_ENV_VAR]);
+  }
+
+  /** Keychain mode: the empty slot "Add Account" gave this window, if any. */
+  getPendingSlot(): string | undefined {
+    return this.context.workspaceState.get<string>(PENDING_SLOT_KEY);
+  }
+
+  /**
+   * Keychain mode: points this window at a fresh, EMPTY credential slot, so the
+   * next sign-in here lands in a slot of its own instead of replacing the account
+   * the window was running. The window stops running that account; reconcile()
+   * saves whatever signs in here as a new account whose store is this slot.
+   */
+  async bindPendingSlot(slot: string): Promise<void> {
+    await this.context.workspaceState.update(PENDING_SLOT_KEY, slot);
+    await this.context.workspaceState.update(ACTIVE_KEY, undefined);
+    const repo = this.getRepoKey();
+    if (repo && this.getRepoMap()[repo] !== undefined) {
+      const map = { ...this.getRepoMap() };
+      delete map[repo];
+      await this.context.globalState.update(REPO_MAP_KEY, map);
+    }
+    const dir = this.workingDir();
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    ensureSharedHistory([dir]);
+    log(`bind: pending slot ${slot} → ${dir}`);
+    this.setEnv(dir, slot);
+    this.onDidChange.fire();
+  }
+
+  /**
+   * Sets both halves of a window's binding — process env for `claude` spawned by
+   * Claude Code, the terminal collection for integrated terminals. The credential
+   * slot is only ever set in keychain mode; elsewhere the token lives in `dir`.
+   */
+  private setEnv(dir: string | undefined, secureDir: string | undefined): void {
+    if (dir) process.env[ENV_VAR] = dir;
+    else delete process.env[ENV_VAR];
+    // An EMPTY value is meaningful (the default slot), so test for undefined.
+    const slot = keychainMode() && secureDir ? slotEnvValue(secureDir) : undefined;
+    if (slot !== undefined) process.env[SECURE_ENV_VAR] = slot;
+    else delete process.env[SECURE_ENV_VAR];
+    this.applyTerminalEnv(dir, slot);
   }
 
   /**
@@ -169,11 +226,13 @@ export class WindowBinding {
    * children of VSCode at all and cannot be reached by any extension API; they
    * keep using the default account.
    */
-  private applyTerminalEnv(dir: string | undefined): void {
+  private applyTerminalEnv(dir: string | undefined, secureDir: string | undefined): void {
     const collection = this.context.environmentVariableCollection;
     collection.description = 'Claude account for this window';
     if (dir) collection.replace(ENV_VAR, dir);
     else collection.delete(ENV_VAR);
+    if (secureDir !== undefined) collection.replace(SECURE_ENV_VAR, secureDir);
+    else collection.delete(SECURE_ENV_VAR);
   }
 
   /**
@@ -207,8 +266,19 @@ export class WindowBinding {
     // pass only covers dirs that exist at activation; this covers the gap.
     ensureSharedHistory([dir]);
     log(`bind: ${account.name} → ${dir} (was ${process.env[ENV_VAR] ?? '(default)'})`);
-    process.env[ENV_VAR] = dir;
-    this.applyTerminalEnv(dir);
+    this.setEnv(dir, account.dir);
+    // An "Add Account" slot abandoned without a sign-in (the user switched to a
+    // saved account instead) is an empty folder; tidy it. rmdir only removes an
+    // EMPTY dir, so a slot that did receive anything is never at risk.
+    const pending = this.getPendingSlot();
+    if (pending && path.normalize(pending) !== path.normalize(account.dir)) {
+      try {
+        fs.rmdirSync(pending);
+      } catch {
+        /* not empty, or already gone */
+      }
+    }
+    await this.context.workspaceState.update(PENDING_SLOT_KEY, undefined);
     await this.context.workspaceState.update(ACTIVE_KEY, account.name);
     await this.context.globalState.update(LAST_KEY, account.name);
     const repo = this.getRepoKey();
@@ -230,6 +300,13 @@ export class WindowBinding {
    * on nothing else can write to it.
    */
   applyStored(resolve: (name: string) => Account | undefined): Account | undefined {
+    // "Add Account" pending: come up on the empty slot, signed out, whatever this
+    // window ran before — that is what the user asked for.
+    const pending = keychainMode() ? this.getPendingSlot() : undefined;
+    if (pending) {
+      this.setEnv(this.workingDir(), pending);
+      return undefined;
+    }
     // This window's own choice, if it ever made one.
     let name = this.getActiveName();
     // Otherwise fall back to the last account used anywhere — but ONLY for a window
@@ -247,13 +324,12 @@ export class WindowBinding {
       // The terminal collection is persisted by VSCode across restarts, so a
       // forgotten account's dir can survive there and keep pointing terminals at
       // a signed-out account. Drop it whenever this window has no account.
-      this.applyTerminalEnv(undefined);
+      this.applyTerminalEnv(undefined, undefined);
       return undefined;
     }
     const dir = this.workingDir();
     materialize(account, dir);
-    process.env[ENV_VAR] = dir;
-    this.applyTerminalEnv(dir);
+    this.setEnv(dir, account.dir);
     return account;
   }
 

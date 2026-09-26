@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import { Account, readIdentity, hasCredentials } from './accounts';
 import { log } from './log';
+import { keychainMode } from './platform';
 
 /**
  * Per-window working directories.
@@ -97,10 +98,14 @@ export function materialize(account: Account, workingDir: string, force = false)
   if (hasCredentials(workingDir) && readIdentity(workingDir)?.email === account.email) return false;
   try {
     fs.mkdirSync(workingDir, { recursive: true, mode: 0o700 });
-    copyFile(path.join(account.dir, '.credentials.json'), path.join(workingDir, '.credentials.json'));
+    // In keychain mode the token stays in the account's slot, which the window
+    // reaches through CLAUDE_SECURESTORAGE_CONFIG_DIR — only the config moves.
+    if (!keychainMode()) {
+      copyFile(path.join(account.dir, '.credentials.json'), path.join(workingDir, '.credentials.json'));
+    }
     // The config carries the account's identity AND its per-project state (folder
     // trust, allowed tools, MCP servers), so an account keeps those wherever it runs.
-    copyFile(path.join(account.dir, '.claude.json'), path.join(workingDir, '.claude.json'));
+    copyFile(configFileOf(account.dir), path.join(workingDir, '.claude.json'));
     log(`workdir: ${workingDir} now runs ${account.email ?? account.name}`);
     return true;
   } catch (err) {
@@ -116,6 +121,9 @@ export function materialize(account: Account, workingDir: string, force = false)
  * churned by every window that runs it.
  */
 export function refreshStore(account: Account, workingDir: string): void {
+  // Keychain mode: every window running the account shares its one slot, so a
+  // refreshed token is already in the store.
+  if (keychainMode()) return;
   const src = path.join(workingDir, '.credentials.json');
   const dst = path.join(account.dir, '.credentials.json');
   try {
@@ -142,6 +150,19 @@ export function allWorkingDirs(): string[] {
   } catch {
     return []; // nothing created yet
   }
+}
+
+/**
+ * The config file holding a store's identity. A store is normally a named dir
+ * with its own `.claude.json`; the one exception is a keychain-mode account whose
+ * slot is the default `~/.claude`, which keeps its identity at the home root.
+ */
+export function configFileOf(dir: string): string {
+  const own = path.join(dir, '.claude.json');
+  if (path.normalize(dir) === path.normalize(path.join(os.homedir(), '.claude'))) {
+    return path.join(os.homedir(), '.claude.json');
+  }
+  return own;
 }
 
 function copyFile(src: string, dst: string): void {

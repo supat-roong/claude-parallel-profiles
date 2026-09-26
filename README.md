@@ -1,7 +1,7 @@
 # Claude Parallel Accounts
 
 [![CI](https://img.shields.io/github/actions/workflow/status/DercasDrol/claude-parallel-profiles/ci.yml?label=CI)](https://github.com/DercasDrol/claude-parallel-profiles/actions)
-[![Platform: Linux](https://img.shields.io/badge/platform-Linux%20%7C%20WSL%20%7C%20SSH-orange.svg)](#requirements)
+[![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL%20%7C%20SSH-orange.svg)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **A companion for the [Claude Code extension for VS Code](https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code): run a different Claude account in each VSCode window, at the same time — with one shared conversation history.**
@@ -12,7 +12,7 @@ Claude Code signs you into **one** account, shared by every VSCode window. If yo
 
 ℹ️ It's a **companion**, not a replacement: the official Claude Code extension must be installed; this one only controls which account each window uses.
 
-> 🐧 **Linux only (for now).** Built and tested on Linux: desktop VSCode on Linux, **WSL**, **Remote-SSH** to a Linux host, and dev containers. The check happens where the extension actually runs — in a WSL/SSH window that's the *remote* side — so a Windows desktop driving a Linux remote is fully supported. On macOS and native Windows the Marketplace doesn't offer the extension at all, and a side-loaded VSIX stays completely **inert**: no files read or written, no accounts touched — the status bar says why. (Reason: Claude Code stores credentials differently there, e.g. the macOS Keychain, and guessing would be worse than declining.)
+> 🐧🍎 **Linux and macOS.** Built and tested on Linux: desktop VSCode on Linux, **WSL**, **Remote-SSH** to a Linux host, and dev containers — and on **macOS** where Claude Code keeps its sign-in in `~/.claude/.credentials.json`. The check happens where the extension actually runs — in a WSL/SSH window that's the *remote* side — so a Windows desktop driving a Linux remote is fully supported. A Mac whose Claude Code keeps its sign-in in the **Keychain** runs in [keychain mode](#macos-keychain-mode) (experimental). On native Windows the extension stays completely **inert**: no files read or written, no accounts touched — the status bar says why.
 
 ---
 
@@ -33,8 +33,8 @@ Claude Code signs you into **one** account, shared by every VSCode window. If yo
 
 | Requirement | Notes |
 | --- | --- |
-| Linux environment | desktop Linux, WSL, Remote-SSH (Linux host), or a dev container |
-| VSCode ≥ 1.85 | the extension installs into the (remote) Linux side |
+| Linux or macOS | desktop Linux, WSL, Remote-SSH (Linux host), a dev container, or a Mac (Keychain-backed Macs: see [keychain mode](#macos-keychain-mode)) |
+| VSCode ≥ 1.85 | on WSL/SSH the extension installs into the remote Linux side |
 | [Claude Code extension](https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code) | the thing being multiplied |
 | `claude` CLI on `$PATH` | asked read-only whether a directory is signed in |
 
@@ -107,7 +107,19 @@ The details that make it reliable — each one a bug found and fixed:
 - **Terminals follow the window.** Integrated terminals get the window's account via VSCode's environment-variable API. External terminals (outside VSCode) keep using the default `~/.claude`.
 - **Reload safety.** Automatic reloads (after a forget or an in-window sign-in) go through a circuit breaker: state is corrected *before* reloading, and at most one automatic reload per minute — a misbehaving edge case degrades to a message with a button, never a reload loop.
 - **Survives its own absence.** The account you last used is mirrored into Claude Code's own default `~/.claude` on every sync, so if the extension is ever gone — uninstalled, disabled, or not yet activated — Claude Code is already signed in there and just works. Nothing important waits on the uninstall script, which VSCode defers to its next restart and may never run.
-- **Found where it runs.** The extension is published as a single universal package, not per-platform. In WSL and Remote-SSH it executes on the Linux *remote*, but the VSCode *client* that resolves the Marketplace is often Windows or macOS — a Linux-only build would be invisible to that client, which then reports the extension as missing and never updates it. The Linux requirement is enforced at runtime instead (the inert mode above).
+- **Found where it runs.** The extension is published as a single universal package, not per-platform. In WSL and Remote-SSH it executes on the Linux *remote*, but the VSCode *client* that resolves the Marketplace is often Windows or macOS — a Linux-only build would be invisible to that client, which then reports the extension as missing and never updates it. The platform requirement is enforced at runtime instead (the inert mode above).
+
+---
+
+## macOS Keychain mode
+
+Experimental. On most setups Claude Code keeps its sign-in in a file, which this extension copies into each window's own directory. On a Mac whose Claude Code keeps it in the **Keychain** instead (detected automatically: `~/.claude.json` names an account but `~/.claude/.credentials.json` doesn't exist), there is no file to copy — and this extension will not read or write Keychain secrets. So it works differently there:
+
+- **An account's store is its credential slot.** Every window running an account points `CLAUDE_SECURESTORAGE_CONFIG_DIR` at that account's store, while `CLAUDE_CONFIG_DIR` stays on the window's own directory. Claude Code keeps one Keychain entry per store and manages it itself.
+- **Signing in replaces the window's account.** A sign-in writes into the window's slot — the account it is running — so that account is signed out on this Mac. The extension notices and says so.
+- **Use *Add Account* to add one.** It gives the window a fresh, empty slot (`~/.claude-slot-…`) and reloads it signed out; whatever you sign in with there is saved as a new account. It's in the command palette, the Switch list, and the status-bar menu.
+- **Forget** runs `claude auth logout` against the account's slot, so Claude Code deletes its own Keychain entry.
+- **Not kept in step:** the default `~/.claude` is not re-pointed at your last account (there is no file to mirror), and uninstalling cannot remove slot Keychain entries — *Forget* accounts first if you want them gone.
 
 ---
 
@@ -124,9 +136,10 @@ This extension is built to manage credentials, so it holds itself to a strict po
 - **No telemetry, no analytics, no network code at all.** The source contains zero network calls and **zero runtime dependencies** — it is your files, the `vscode` API, and Node's standard library. Nothing is ever sent anywhere.
 - **Everything stays in your home directory.** Accounts, working copies and the history store live under `~/.claude*`, created with owner-only permissions (`600`/`700`). Credentials are only ever *copied between* Claude Code's own data directories on this machine — never parsed beyond checking they exist, never displayed, never transmitted.
 - **Conversations are moved, not read.** Shared history relinks the files; the extension does not inspect their contents.
-- **Minimal footprint elsewhere:** the workspace folder path is hashed to tell windows apart; `claude auth status` is asked (locally, read-only) to confirm a directory is signed in; on Linux/WSL the process list is scanned only during *Forget*, to stop `claude` processes running on the token being deleted.
+- **Minimal footprint elsewhere:** the workspace folder path is hashed to tell windows apart; `claude auth status` is asked (locally, read-only) to confirm a directory is signed in; the process list (`/proc` on Linux/WSL, `ps` on macOS) is scanned only during *Forget*, to stop `claude` processes running on the token being deleted.
 - **Self-restricted in the VSCode manifest:** disabled in virtual workspaces, and in Restricted Mode (untrusted folders) it never reads workspace content — only the folder's path, to tell windows apart ([`capabilities`](package.json)).
-- **Inert off Linux.** On unsupported platforms it performs no operations at all — no file reads, no writes, no account changes; the uninstall hook is guarded the same way.
+- **Never touches the Keychain.** In keychain mode, Keychain entries are created and deleted only by Claude Code itself (sign-in, and `claude auth logout` on *Forget*).
+- **Inert where unsupported.** On native Windows it performs no operations at all — no file reads, no writes, no account changes; the uninstall hook is guarded the same way.
 - **Uninstalling cleans up after itself:** the directories the extension created are deleted and stray OAuth tokens wiped; the one token it leaves is in `~/.claude`, exactly where Claude Code keeps its own login with no extension installed — see [Uninstalling](#uninstalling).
 
 ---
@@ -149,7 +162,7 @@ Your other accounts stay signed out afterwards — sign into them the normal way
 
 ## Limitations
 
-- **Linux only for now.** On macOS Claude Code keeps credentials in the Keychain (not files) and native Windows is untested — on both, the extension refuses to run rather than guess (see the note at the top). Support may come later.
+- **Linux and macOS only for now.** Native Windows is untested — there the extension refuses to run rather than guess (see the note at the top). On Keychain-backed Macs, [keychain mode](#macos-keychain-mode) is experimental and a sign-in replaces the window's account; add accounts with *Add Account*.
 - **Loads at every VSCode start-up** (`*` activation). Required to win the activation race against Claude Code — see [How it works](#how-it-works). The extension is deliberately tiny, so the impact is milliseconds.
 - **API-key users**: this is for OAuth (claude.ai) logins. With `ANTHROPIC_API_KEY` you don't need it — set the key per window yourself.
 - **Switching reloads the window** — a consequence of Claude Code reading its account once at start-up; surfaced honestly rather than pretended around.

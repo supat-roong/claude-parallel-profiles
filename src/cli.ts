@@ -1,6 +1,7 @@
 import { execFile } from 'child_process';
 import { log } from './log';
 import { readIdentity } from './accounts';
+import { SECURE_ENV_VAR, keychainMode, slotEnvValue } from './platform';
 
 /**
  * Thin wrapper around the `claude` CLI's auth commands, scoped to a specific
@@ -18,9 +19,32 @@ export interface AuthStatus {
   subscriptionType?: string;
 }
 
-/** Runs a claude CLI command through a login shell so nvm/PATH resolve. */
-function runClaude(args: string, dir: string, timeoutMs: number): Promise<string> {
+/** A failed CLI run, keeping whatever the command printed before exiting. */
+class CliError extends Error {
+  constructor(message: string, readonly stdout = '') {
+    super(message);
+  }
+}
+
+/**
+ * Runs a claude CLI command through a login shell so nvm/PATH resolve.
+ *
+ * `secureDir` pins the credential slot (keychain mode). Left undefined, the
+ * slot is whatever this host's env already says — the window's own binding —
+ * or, in keychain mode, the default slot: CLAUDE_CONFIG_DIR is always set here,
+ * and without a slot of its own Claude Code would derive one from that path.
+ */
+function runClaude(
+  args: string,
+  dir: string,
+  timeoutMs: number,
+  secureDir?: string
+): Promise<string> {
   const shell = process.env.SHELL || '/bin/bash';
+  const slot =
+    secureDir !== undefined
+      ? slotEnvValue(secureDir)
+      : process.env[SECURE_ENV_VAR] ?? (keychainMode() ? '' : undefined);
   return new Promise((resolve, reject) => {
     // execFile's own `timeout` sends SIGTERM, which a login shell can trap and
     // ignore — leaving the callback pending forever. Escalate to SIGKILL and
@@ -28,10 +52,18 @@ function runClaude(args: string, dir: string, timeoutMs: number): Promise<string
     const child = execFile(
       shell,
       ['-lc', `claude ${args}`],
-      { env: { ...process.env, CLAUDE_CONFIG_DIR: dir }, timeout: timeoutMs, killSignal: 'SIGKILL' },
+      {
+        env: {
+          ...process.env,
+          CLAUDE_CONFIG_DIR: dir,
+          ...(slot !== undefined ? { [SECURE_ENV_VAR]: slot } : {}),
+        },
+        timeout: timeoutMs,
+        killSignal: 'SIGKILL',
+      },
       (err, stdout, stderr) => {
         clearTimeout(hardTimer);
-        if (err) reject(new Error(stderr?.toString() || err.message));
+        if (err) reject(new CliError(stderr?.toString() || err.message, stdout?.toString()));
         else resolve(stdout.toString());
       }
     );
@@ -41,7 +73,7 @@ function runClaude(args: string, dir: string, timeoutMs: number): Promise<string
       } catch {
         /* already gone */
       }
-      reject(new Error(`claude ${args} timed out after ${timeoutMs}ms`));
+      reject(new CliError(`claude ${args} timed out after ${timeoutMs}ms`));
     }, timeoutMs + 1000);
     if (typeof hardTimer.unref === 'function') hardTimer.unref();
   });
@@ -55,8 +87,21 @@ export async function getAuthStatus(
   dir: string,
   timeoutMs = 15000
 ): Promise<AuthStatus | null> {
+  let out: string;
   try {
-    const out = await runClaude('auth status --json', dir, timeoutMs);
+    out = await runClaude('auth status --json', dir, timeoutMs);
+  } catch (err) {
+    // `auth status` exits 1 when signed out — but still prints its verdict. That
+    // is an ANSWER ("signed out"), not a failure to ask; discarding it made the
+    // status bar treat every signed-out dir as "claude CLI unreachable".
+    const stdout = err instanceof CliError ? err.stdout.trim() : '';
+    if (!stdout.startsWith('{')) {
+      log(`auth status(${dir}) FAILED: ${(err as Error).message.split('\n')[0]}`);
+      return null;
+    }
+    out = stdout;
+  }
+  try {
     const parsed = JSON.parse(out) as AuthStatus;
     // Recent Claude Code versions (2.1.x) return `email: null` from
     // `auth status --json` even when logged in via claude.ai. The email still
@@ -75,5 +120,26 @@ export async function getAuthStatus(
   } catch (err) {
     log(`auth status(${dir}) FAILED: ${(err as Error).message.split('\n')[0]}`);
     return null;
+  }
+}
+
+/**
+ * Keychain mode: signs a credential slot out through Claude Code's own logout,
+ * so Claude Code deletes its own Keychain entry — this extension never touches
+ * the Keychain. `configDir` is the dir whose identity the logout clears too.
+ * Returns false if the CLI could not be run. Never throws.
+ */
+export async function logoutSlot(
+  secureDir: string,
+  configDir: string,
+  timeoutMs = 15000
+): Promise<boolean> {
+  try {
+    await runClaude('auth logout', configDir, timeoutMs, secureDir);
+    log(`auth logout(slot ${secureDir}): done`);
+    return true;
+  } catch (err) {
+    log(`auth logout(slot ${secureDir}) FAILED: ${(err as Error).message.split('\n')[0]}`);
+    return false;
   }
 }

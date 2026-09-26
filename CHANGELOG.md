@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **macOS Keychain mode (experimental).** A Mac whose Claude Code keeps its sign-in in the Keychain is detected (the default account has an identity but no credential file) and handled without touching the Keychain: each account's store is its credential slot, which windows reach through `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Signing in inside a window replaces its account there; the new **Add Account** command gives a window a fresh slot to sign in to. *Forget* finds live `claude` sessions through `ps` and signs the slot out with `claude auth logout`.
+
 ## 1.2.5 — 2026-07-12
 
 ### Fixed

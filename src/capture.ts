@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { AuthStatus } from './cli';
 import { AccountIdentity } from './accounts';
+import { keychainMode } from './platform';
 
 /**
  * Snapshots the account currently signed in inside `sourceDir` into a dedicated
@@ -18,6 +19,10 @@ export function snapshotAccount(
   targetDir: string,
   status: AuthStatus
 ): void {
+  if (keychainMode()) {
+    snapshotIdentity(sourceDir, targetDir, status);
+    return;
+  }
   const srcCreds = path.join(sourceDir, '.credentials.json');
   if (!fs.existsSync(srcCreds)) {
     throw new Error(`No credentials found in ${sourceDir} — sign in first.`);
@@ -56,6 +61,64 @@ export function snapshotAccount(
     writeMinimalIdentity(dstIdentity, status);
   }
   ensureIdentity(targetDir, status);
+}
+
+/**
+ * Keychain mode: the token is already where it belongs — `targetDir` is the
+ * credential slot the sign-in wrote to — so saving the account means recording
+ * its identity (and per-project config) alongside it. A slot that is the default
+ * `~/.claude` keeps its identity at the home root, where Claude Code wrote it.
+ */
+function snapshotIdentity(sourceDir: string, targetDir: string, status: AuthStatus): void {
+  if (isDefaultDir(targetDir)) {
+    // A window running the default slot signs in with its working dir as config
+    // dir, so `~/.claude.json` may still name the account the slot USED to hold —
+    // and the registry would prune the new account as "replaced" on sight.
+    if (!isDefaultDir(sourceDir)) {
+      const source = readIdentityObject(path.join(sourceDir, '.claude.json'));
+      setHomeIdentity(source ?? { emailAddress: status.email, organizationName: status.orgName });
+    }
+    return;
+  }
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  const srcIdentity = firstExisting([
+    path.join(sourceDir, '.claude.json'),
+    isDefaultDir(sourceDir) ? path.join(os.homedir(), '.claude.json') : '',
+  ]);
+  const dstIdentity = path.join(targetDir, '.claude.json');
+  if (srcIdentity && path.normalize(srcIdentity) !== path.normalize(dstIdentity)) {
+    const tmp = `${dstIdentity}.tmp`;
+    fs.copyFileSync(srcIdentity, tmp);
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, dstIdentity);
+  } else if (!srcIdentity) {
+    writeMinimalIdentity(dstIdentity, status);
+  }
+  ensureIdentity(targetDir, status);
+}
+
+function readIdentityObject(file: string): Record<string, unknown> | undefined {
+  try {
+    const obj = JSON.parse(fs.readFileSync(file, 'utf-8')) as { oauthAccount?: Record<string, unknown> };
+    return obj.oauthAccount?.emailAddress ? obj.oauthAccount : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Replaces the default account's identity in `~/.claude.json`, keeping the rest. */
+function setHomeIdentity(oauthAccount: Record<string, unknown>): void {
+  const cfg = path.join(os.homedir(), '.claude.json');
+  let obj: Record<string, unknown> = {};
+  try {
+    obj = JSON.parse(fs.readFileSync(cfg, 'utf-8')) as Record<string, unknown>;
+  } catch {
+    obj = {};
+  }
+  obj.oauthAccount = oauthAccount;
+  const tmp = `${cfg}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, cfg); // atomic: a half-written config bricks Claude Code
 }
 
 /** Makes sure oauthAccount in the target reflects `status` (best effort). */
@@ -135,6 +198,10 @@ export function defaultSourceDir(): string {
  * account signed in with no name).
  */
 export function mirrorToDefault(sourceDir: string, identity: AccountIdentity | null): void {
+  // Keychain mode has no token file to mirror, and copying a Keychain entry is
+  // exactly what that mode refuses to do. The default slot keeps whichever
+  // account last signed in there.
+  if (keychainMode()) return;
   const defaultDir = defaultSourceDir();
   if (isDefaultDir(sourceDir)) return; // already is the default
   const srcToken = path.join(sourceDir, '.credentials.json');

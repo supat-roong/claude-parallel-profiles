@@ -4,6 +4,7 @@ import { log } from './log';
 import { WindowBinding } from './binding';
 import { getAuthStatus, AuthStatus } from './cli';
 import { defaultSourceDir } from './capture';
+import { keychainMode } from './platform';
 
 /** Marketplace id — the hover links to the extension's own page with it. */
 const EXTENSION_ID = 'DercasDrol.claude-parallel-accounts';
@@ -300,6 +301,17 @@ export class StatusBarManager implements vscode.Disposable {
       return;
     }
     // Single saved account and it's the current one — teach the next step.
+    if (keychainMode()) {
+      // Signing in here would REPLACE this account (keychain mode) — adding one
+      // goes through a fresh slot instead.
+      const pick = await vscode.window.showInformationMessage(
+        `${email} is your only saved account. To add another one, use Add Account — signing in ` +
+          `right here would replace ${email}.`,
+        'Add Account'
+      );
+      if (pick === 'Add Account') await vscode.commands.executeCommand('claudeProfiles.addAccount');
+      return;
+    }
     vscode.window.showInformationMessage(
       `${email} is your only saved account. To add another one: sign in as it in Claude Code (/login), then click here to save it.`
     );

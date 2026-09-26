@@ -2,12 +2,14 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { keychainMode } from './platform';
 
 /**
  * An account = a Claude Code data directory (CLAUDE_CONFIG_DIR) that has been
  * logged in. Everything Claude Code needs lives inside it:
  *   <dir>/.claude.json        → config + oauthAccount identity
- *   <dir>/.credentials.json   → OAuth tokens (file-based on Linux/WSL)
+ *   <dir>/.credentials.json   → OAuth tokens (file-based; a Keychain-backed Mac keeps
+ *                                them in a Keychain slot instead — see platform.ts)
  *
  * We NEVER touch ~/.claude.json (the global default) — isolation is achieved
  * purely by pointing each window's process.env.CLAUDE_CONFIG_DIR at a dir.
@@ -76,8 +78,15 @@ export function readIdentity(dir: string): AccountIdentity | null {
   return null;
 }
 
-/** True if the dir looks like a logged-in Claude Code config dir. */
+/**
+ * True if the dir looks like a logged-in Claude Code config dir.
+ *
+ * In keychain mode there is no token file to find, so the identity stands in for
+ * it: Claude Code's own logout clears `oauthAccount` along with the token, and so
+ * does ours (reclaim.signOut) — an identity is present exactly while signed in.
+ */
 export function hasCredentials(dir: string): boolean {
+  if (keychainMode()) return readIdentity(dir) !== null;
   return fs.existsSync(path.join(dir, '.credentials.json'));
 }
 
@@ -198,7 +207,12 @@ export class AccountRegistry {
    * new accounts appear, and signed-out ones disappear.
    */
   async pruneSignedOut(): Promise<Account[]> {
-    const gone = this.list().filter((a) => !hasCredentials(a.dir));
+    // In keychain mode an account's store is its credential slot, and a sign-in
+    // in a window running it REPLACES it: the slot then names another email. The
+    // account it used to hold no longer exists anywhere.
+    const replaced = (a: Account) =>
+      keychainMode() && a.email !== undefined && readIdentity(a.dir)?.email !== a.email;
+    const gone = this.list().filter((a) => !hasCredentials(a.dir) || replaced(a));
     for (const a of gone) await this.remove(a.name);
     return gone;
   }
@@ -220,6 +234,9 @@ export class AccountRegistry {
 
   /** Restores a previously forgotten account matching this email, if any. */
   async restoreForgotten(email: string): Promise<Account | undefined> {
+    // In keychain mode a forgotten store's slot was emptied by the logout, and a
+    // new sign-in lands in a fresh slot — the old entry has nothing to restore.
+    if (keychainMode()) return undefined;
     const list = this.listForgotten();
     const found = list.find((a) => (a.email ?? readIdentity(a.dir)?.email) === email);
     if (!found) return undefined;

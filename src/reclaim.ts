@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { execFileSync } from 'child_process';
 import { log } from './log';
 import { readIdentity } from './accounts';
 
@@ -112,21 +113,39 @@ export function signOut(dir: string): boolean {
 }
 
 /**
- * Live `claude` processes grouped by the CLAUDE_CONFIG_DIR they run against,
- * read from /proc on Linux/WSL. A process with no CLAUDE_CONFIG_DIR uses the
- * default `~/.claude`. Returns an EMPTY map where /proc is unavailable (e.g.
- * native Windows/macOS). Keys are normalized for direct comparison.
+ * Live `claude` processes grouped by the CLAUDE_CONFIG_DIR they run against —
+ * read from /proc on Linux/WSL, from `ps` on macOS. A process with no
+ * CLAUDE_CONFIG_DIR uses the default `~/.claude`. Returns an EMPTY map where
+ * neither works. Keys are normalized for direct comparison.
  */
 export function claudeSessionsByDir(): Map<string, number[]> {
   const byDir = new Map<string, number[]>();
+  const defaultDir = path.normalize(path.join(os.homedir(), '.claude'));
+  const sessions = process.platform === 'darwin' ? claudeSessionsFromPs() : claudeSessionsFromProc();
+  for (const { pid, configDir } of sessions) {
+    const dir = configDir ? path.normalize(configDir) : defaultDir;
+    const list = byDir.get(dir) ?? [];
+    list.push(pid);
+    byDir.set(dir, list);
+  }
+  return byDir;
+}
+
+interface ClaudeSession {
+  pid: number;
+  configDir?: string;
+}
+
+const CONFIG_DIR_PREFIX = 'CLAUDE_CONFIG_DIR=';
+
+function claudeSessionsFromProc(): ClaudeSession[] {
   let pids: string[];
   try {
     pids = fs.readdirSync('/proc').filter((p) => /^\d+$/.test(p));
   } catch {
-    return byDir; // no /proc on this platform
+    return []; // no /proc on this platform
   }
-  const defaultDir = path.normalize(path.join(os.homedir(), '.claude'));
-  const PREFIX = 'CLAUDE_CONFIG_DIR=';
+  const sessions: ClaudeSession[] = [];
   for (const pid of pids) {
     let comm: string;
     try {
@@ -141,13 +160,47 @@ export function claudeSessionsByDir(): Map<string, number[]> {
     } catch {
       continue;
     }
-    const entry = environ.split('\0').find((e) => e.startsWith(PREFIX));
-    const dir = entry ? path.normalize(entry.slice(PREFIX.length)) : defaultDir;
-    const list = byDir.get(dir) ?? [];
-    list.push(Number(pid));
-    byDir.set(dir, list);
+    const entry = environ.split('\0').find((e) => e.startsWith(CONFIG_DIR_PREFIX));
+    sessions.push({ pid: Number(pid), configDir: entry?.slice(CONFIG_DIR_PREFIX.length) });
   }
-  return byDir;
+  return sessions;
+}
+
+/**
+ * macOS has no /proc. `ps -o comm=` gives each process's executable path (the
+ * Claude Code extension's native binary ends in `/claude`), and `ps -E` appends
+ * a process's environment to its command line — readable for the user's own
+ * processes, which is all a forget may signal anyway.
+ *
+ * The environment comes back space-joined, so a CLAUDE_CONFIG_DIR containing a
+ * space is cut short there; ours live under the home dir and have none.
+ */
+function claudeSessionsFromPs(): ClaudeSession[] {
+  const ps = (args: string[]): string =>
+    execFileSync('ps', args, { encoding: 'utf-8', timeout: 5000, maxBuffer: 16 * 1024 * 1024 });
+  let pids: number[];
+  try {
+    pids = ps(['-A', '-o', 'pid=,comm='])
+      .split('\n')
+      .map((line) => /^\s*(\d+)\s+(.+)$/.exec(line))
+      .filter((m): m is RegExpExecArray => m !== null && path.basename(m[2].trim()) === 'claude')
+      .map((m) => Number(m[1]));
+  } catch {
+    return []; // ps unavailable — same as no /proc: nothing to signal
+  }
+  const sessions: ClaudeSession[] = [];
+  for (const pid of pids) {
+    let line: string;
+    try {
+      line = ps(['-E', '-ww', '-o', 'command=', '-p', String(pid)]);
+    } catch {
+      continue; // process gone or not ours
+    }
+    // The environment follows the arguments, so the LAST match is the env var.
+    const matches = [...line.matchAll(/(?:^|\s)CLAUDE_CONFIG_DIR=(\S+)/g)];
+    sessions.push({ pid, configDir: matches[matches.length - 1]?.[1] });
+  }
+  return sessions;
 }
 
 /**
@@ -156,7 +209,7 @@ export function claudeSessionsByDir(): Map<string, number[]> {
  * SIGKILL on purpose: on a graceful SIGTERM shutdown Claude Code flushes its
  * in-memory token back to `.credentials.json`, which would resurrect the very
  * file we're about to delete. Callers MUST call this BEFORE removeToken.
- * Returns the number of processes signalled. No-op where /proc is unavailable.
+ * Returns the number of processes signalled. No-op where sessions can't be listed.
  */
 export function interruptSessions(dirs: string[]): number {
   const targets = new Set(dirs.map((d) => path.normalize(d)));
